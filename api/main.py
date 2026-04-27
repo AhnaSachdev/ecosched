@@ -1,79 +1,130 @@
-import requests
-from fastapi import FastAPI
-from pydantic import BaseModel
-import os
-from dotenv import load_dotenv
-import google.generativeai as genai
-
-load_dotenv()
-
-app = FastAPI()
+from jobs_router import router as jobs_router
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, func
+from contextlib import asynccontextmanager
+from db import init_db, engine, Decision
+from gemini_engine import decide
+import asyncio, json, logging
+
+ws_clients: list[WebSocket] = []
+_co2_total = 0.0
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await init_db()
+    yield
+
+app = FastAPI(title="EcoSched API", lifespan=lifespan)
+app.include_router(jobs_router)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # allow all (for development)
-    allow_credentials=True,
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+@app.post("/internal/decide")
+async def internal_decide(payload: dict):
+    global _co2_total
 
-class Prompt(BaseModel):
-    text: str
+    result = await decide(payload)
 
-# ✅ ADD THIS
-@app.get("/")
-def root():
-    return {"message": "API is running"}
+    async with AsyncSession(engine) as session:
+        d = Decision(
+            job_id=payload["job_id"],
+            job_name=payload["job_name"],
+            action=result["action"],
+            defer_score=result["defer_score"],
+            co2_saved=result.get("co2_saved_grams", 0),
+            carbon_ci=payload["carbon_ci"],
+            reasoning=result["reasoning"],
+            cpu_burst_pct=payload["cpu_burst_pct"],
+            io_wait_pct=payload["io_wait_pct"]
+        )
+        session.add(d)
+        await session.commit()
 
-@app.post("/ask")
-def ask_gemini(prompt: Prompt):
+    _co2_total += result.get("co2_saved_grams", 0)
+
+    broadcast = {
+        "type": "decision",
+        "job_name": payload["job_name"],
+        "action": result["action"],
+        "reasoning": result["reasoning"],
+        "co2_saved": result.get("co2_saved_grams", 0),
+        "total_co2_saved": round(_co2_total, 2),
+        "carbon_ci": payload["carbon_ci"],
+        "cpu_burst_pct": payload["cpu_burst_pct"],
+        "io_wait_pct": payload["io_wait_pct"]
+    }
+
+    await _broadcast(broadcast)
+    return result
+
+
+@app.get("/api/stats")
+async def get_stats():
+    async with AsyncSession(engine) as session:
+        total_co2 = await session.scalar(
+            select(func.sum(Decision.co2_saved))
+        )
+        count = await session.scalar(
+            select(func.count(Decision.id))
+        )
+        recent = await session.execute(
+            select(Decision).order_by(Decision.id.desc()).limit(20)
+        )
+        rows = recent.scalars().all()
+
+    return {
+        "total_co2_saved_grams": round(total_co2 or 0, 2),
+        "total_decisions": count or 0,
+        "recent": [
+            {
+                "job_name": r.job_name,
+                "action": r.action,
+                "co2_saved": r.co2_saved,
+                "reasoning": r.reasoning,
+                "carbon_ci": r.carbon_ci,
+                "timestamp": r.timestamp
+            }
+            for r in rows
+        ]
+    }
+
+
+@app.websocket("/ws")
+async def websocket_endpoint(ws: WebSocket):
+    await ws.accept()
+    ws_clients.append(ws)
     try:
-        # 🔌 Mock electricity data (temporary)
-        electricity_data = {
-            "zone": "IN-NO",
-            "carbonIntensity": 420  # example value
-        }
+        while True:
+            await ws.receive_text()
+    except WebSocketDisconnect:
+        ws_clients.remove(ws)
 
-        # 🧠 Combine with user input
-        full_prompt = f"""
-        You are EcoSched AI.
 
-        Current carbon intensity in {electricity_data['zone']} is {electricity_data['carbonIntensity']} gCO2/kWh.
-
-        Lower values = cleaner electricity.
-        Higher values = more pollution.
-
-        Based on this, answer the user's question:
-
-        {prompt.text}
-        """
-
-        model = genai.GenerativeModel("models/gemini-2.5-flash")
-        response = model.generate_content(full_prompt)
-
-        return {"response": response.text}
-
-    except Exception as e:
-        return {"error": str(e)}
-@app.get("/test-electricity")
-def test_electricity():
-    try:
-        url = "https://api.electricitymaps.com/v3/carbon-intensity/latest"
-
-        headers = {
-            "auth-token": os.getenv("ELECTRICITY_MAPS_API_KEY")
-        }
-
-        params = {
-            "zone": os.getenv("ELECTRICITY_MAPS_ZONE")
-        }
-
-        res = requests.get(url, headers=headers, params=params)
-
-        return res.json()
-
-    except Exception as e:
-        return {"error": str(e)}
+async def _broadcast(data: dict):
+    dead = []
+    for ws in ws_clients:
+        try:
+            await ws.send_json(data)
+        except:
+            dead.append(ws)
+    for ws in dead:
+        ws_clients.remove(ws)
+@app.get("/api/carbon")
+async def carbon_forecast():
+    return {
+        "current": 350,
+        "forecast": [
+            {"time": "now", "ci": 350},
+            {"time": "+1h", "ci": 330},
+            {"time": "+2h", "ci": 300},
+            {"time": "+3h", "ci": 280},
+            {"time": "+4h", "ci": 260}
+        ]
+    }
