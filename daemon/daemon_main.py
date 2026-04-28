@@ -61,6 +61,12 @@ async def run_cycle():
         except Exception as e:
             logging.error(f"Cycle error for {job.name}: {e}")
 
+async def fetch_jobs():
+    async with httpx.AsyncClient() as client:
+        r = await client.get(f"{API_URL}/api/jobs")
+        return r.json()
+    
+
 async def main():
     import time
     from jobs import Job
@@ -83,6 +89,17 @@ async def main():
     ))
 
     while True:
+        jobs = await fetch_jobs()
+
+        for j in jobs:
+            registry.add(Job(
+                job_id=j["job_id"],
+                name=j["name"],
+                pid=j["pid"],
+                urgency=j["urgency"],
+                deadline=j["deadline"]
+            ))
+
         await run_cycle()
         await asyncio.sleep(2)
 
