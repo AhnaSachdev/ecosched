@@ -1,3 +1,4 @@
+from carbon_router import router as carbon_router
 from jobs_router import router as jobs_router
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -18,6 +19,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="EcoSched API", lifespan=lifespan)
 app.include_router(jobs_router)
+app.include_router(carbon_router)
 
 app.add_middleware(
     CORSMiddleware,
@@ -116,15 +118,3 @@ async def _broadcast(data: dict):
             dead.append(ws)
     for ws in dead:
         ws_clients.remove(ws)
-@app.get("/api/carbon")
-async def carbon_forecast():
-    return {
-        "current": 350,
-        "forecast": [
-            {"time": "now", "ci": 350},
-            {"time": "+1h", "ci": 330},
-            {"time": "+2h", "ci": 300},
-            {"time": "+3h", "ci": 280},
-            {"time": "+4h", "ci": 260}
-        ]
-    }

@@ -37,13 +37,51 @@ Respond with ONLY valid JSON:
   "resume_in_seconds":null_or_int}}
 """
 
-_fallback = {
-    "action": "run",
-    "defer_score": 0.0,
-    "co2_saved_grams": 0,
-    "reasoning": "Fallback: AI timeout",
-    "resume_in_seconds": None
-}
+def _rule_based_fallback(payload: dict):
+    io_wait = payload["io_wait_pct"]
+    carbon = payload["carbon_ci"]
+    urgency = payload["urgency"]
+    deadline = payload["deadline_seconds"]
+    cpu = payload["cpu_burst_pct"]
+
+    # Rule 1 & 2 (highest priority)
+    if deadline < 90 or urgency >= 4:
+        return {
+            "action": "run",
+            "defer_score": 0.0,
+            "co2_saved_grams": 0,
+            "reasoning": "Critical job — cannot defer",
+            "resume_in_seconds": None
+        }
+
+    # Rule 3 (IO wait)
+    if io_wait > 65:
+        return {
+            "action": "throttle",
+            "defer_score": 0.6,
+            "co2_saved_grams": 5,
+            "reasoning": "High IO wait — freeing CPU helps throughput",
+            "resume_in_seconds": None
+        }
+
+    # Rule 5 (carbon high)
+    if carbon > 400 and cpu > 30 and urgency < 3:
+        return {
+            "action": "defer",
+            "defer_score": 0.8,
+            "co2_saved_grams": 10,
+            "reasoning": "High carbon — delaying reduces emissions",
+            "resume_in_seconds": 120
+        }
+
+    # Default
+    return {
+        "action": "run",
+        "defer_score": 0.0,
+        "co2_saved_grams": 0,
+        "reasoning": "Default fallback",
+        "resume_in_seconds": None
+    }
 
 async def decide(payload: dict) -> dict:
     prompt = PROMPT_TEMPLATE.format(**payload)
@@ -79,8 +117,9 @@ async def decide(payload: dict) -> dict:
             return json.loads(text)
         except Exception:
             logging.error(f"Raw Gemini output: {text}")
-            return _fallback
+            return _rule_based_fallback(payload)
 
     except Exception as e:
         logging.error(f"Gemini error: {e}")
-        return _fallback
+        return _rule_based_fallback(payload)
+    
